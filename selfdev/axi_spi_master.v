@@ -1,266 +1,411 @@
-`timescale 1ps/1ps
+`timescale 1ns/1ps
 
-module axi_spi_master #(
-    parameter DEFAULT_CLK_DIV = 4,
+module axi4lite_wrapper_spi #(
     parameter AXI_ADDR_WIDTH = 32,
     parameter AXI_DATA_WIDTH = 32
 )(
-    // Clock and Reset
-    input  wire                        axi_aclk,
-    input  wire                        axi_aresetn,
+    // AXI Clock and Reset
+    input  wire ACLK,
+    input  wire ARESETN,
+
+    // AXI4-Lite Write Channels
+    input  wire [AXI_ADDR_WIDTH-1:0] AWADDR,
+    input  wire AWVALID,
+    output wire AWREADY,
+    input  wire [AXI_DATA_WIDTH-1:0] WDATA,
+    input  wire [(AXI_DATA_WIDTH/8)-1:0] WSTRB,
+    input  wire WVALID,
+    output wire WREADY,
+    output wire [1:0] BRESP,
+    output wire BVALID,
+    input  wire BREADY,
+
+    // AXI4-Lite Read Channels
+    input  wire [AXI_ADDR_WIDTH-1:0] ARADDR,
+    input  wire ARVALID,
+    output wire ARREADY,
+    output wire [AXI_DATA_WIDTH-1:0] RDATA,
+    output wire [1:0] RRESP,
+    output wire RVALID,
+    input  wire RREADY,
     
-    // AXI4-Lite Write Address Channel
-    input  wire [AXI_ADDR_WIDTH-1:0]  s_axi_awaddr,
-    input  wire [2:0]                  s_axi_awprot,
-    input  wire                        s_axi_awvalid,
-    output reg                         s_axi_awready,
-    
-    // AXI4-Lite Write Data Channel
-    input  wire [AXI_DATA_WIDTH-1:0]  s_axi_wdata,
-    input  wire [(AXI_DATA_WIDTH/8)-1:0] s_axi_wstrb,
-    input  wire                        s_axi_wvalid,
-    output reg                         s_axi_wready,
-    
-    // AXI4-Lite Write Response Channel
-    output reg  [1:0]                  s_axi_bresp,
-    output reg                         s_axi_bvalid,
-    input  wire                        s_axi_bready,
-    
-    // AXI4-Lite Read Address Channel
-    input  wire [AXI_ADDR_WIDTH-1:0]  s_axi_araddr,
-    input  wire [2:0]                  s_axi_arprot,
-    input  wire                        s_axi_arvalid,
-    output reg                         s_axi_arready,
-    
-    // AXI4-Lite Read Data Channel
-    output reg  [AXI_DATA_WIDTH-1:0]  s_axi_rdata,
-    output reg  [1:0]                  s_axi_rresp,
-    output reg                         s_axi_rvalid,
-    input  wire                        s_axi_rready,
-    
-    // SPI Interface
-    input  wire                        miso,
-    output wire                        mosi,
-    output wire                        sclk,
-    output wire                        cs,
-    
-    // Interrupt
-    output wire                        irq_out
+    // SPI Physical Ports
+    output wire sclk,
+    output wire mosi,
+    input  wire miso,
+    output wire cs
 );
 
-    // Register Map:
-    // 0x00: CONTROL (bit 0: start, bit 1: enable_irq)
-    // 0x04: STATUS (bit 0: ready, bit 1: busy, bit 2: done, bit 3: irq_flag)
-    // 0x08: TX_DATA
-    // 0x0C: RX_DATA
-    // 0x10: CLK_DIV
+    // Register Map Definition
+    parameter ADDR_CTRL    = 6'h00; // Control Register (WO)
+    parameter ADDR_STAT    = 6'h04; // Status Register (RO/W1C)
+    parameter ADDR_TX      = 6'h08; // Transmit Data Register (WO)
+    parameter ADDR_RX      = 6'h0C; // Receive Data Register (RO)
+    parameter ADDR_CLK_DIV = 6'h10; // Clock Divider Register (RW)
+
+    // ----------------------------------------------------------------
+    // Internal Signals and Registers
+    // ----------------------------------------------------------------
     
-    localparam ADDR_CONTROL = 5'h00;
-    localparam ADDR_STATUS  = 5'h04;
-    localparam ADDR_TX_DATA = 5'h08;
-    localparam ADDR_RX_DATA = 5'h0C;
-    localparam ADDR_CLK_DIV = 5'h10;
+    // AXI internal logic signals
+    reg [AXI_ADDR_WIDTH-1:0] axi_awaddr;
+    reg                      axi_awready;
+    reg                      axi_wready;
+    reg [1:0]                axi_bresp;
+    reg                      axi_bvalid;
     
-    // AXI FSM States
-    localparam AXI_WRITE_IDLE = 2'b00;
-    localparam AXI_WRITE_DATA = 2'b01;
-    localparam AXI_WRITE_RESP = 2'b10;
+    reg [AXI_ADDR_WIDTH-1:0] axi_araddr;
+    reg                      axi_arready;
+    reg [AXI_DATA_WIDTH-1:0] axi_rdata;
+    reg [1:0]                axi_rresp;
+    reg                      axi_rvalid;
+
+    // Separate write address and data received flags
+    reg aw_received;
+    reg w_received;
+    reg [AXI_ADDR_WIDTH-1:0] latched_awaddr;
+    reg [AXI_DATA_WIDTH-1:0] latched_wdata;
+    reg [(AXI_DATA_WIDTH/8)-1:0] latched_wstrb;
+
+    // Slave registers accessible via AXI
+    reg [AXI_DATA_WIDTH-1:0] reg_ctrl;
+    reg [7:0]                reg_tx;
+    reg [7:0]                reg_rx;
+    reg [15:0]               reg_clk_div;
     
-    localparam AXI_READ_IDLE = 2'b00;
-    localparam AXI_READ_DATA = 2'b01;
-    
-    // Internal registers
-    reg        control_start;
-    reg        control_enable_irq;
-    reg [7:0]  tx_data_reg;
-    reg [15:0] clk_div_reg;
-    reg        irq_flag;
-    
-    // AXI FSM registers
-    reg [1:0] axi_write_state;
-    reg [1:0] axi_read_state;
-    reg [AXI_ADDR_WIDTH-1:0] write_addr;
-    reg [AXI_ADDR_WIDTH-1:0] read_addr;
-    
-    // SPI core signals
-    wire       spi_ready;
-    wire       spi_busy;
-    wire       spi_done;
-    wire       spi_irq;
-    wire [7:0] spi_rx_data;
-    
-    // Reset logic
-    wire reset = ~axi_aresetn;
-    
-    // SPI Master instantiation
+    // Status flags
+    reg                      reg_done_sticky;
+    reg                      reg_irq_sticky;
+
+    // FIX #1: Proper start pulse generation
+    reg                      spi_start_req;
+    reg                      spi_start_pulse;
+
+    // Metastability protection for miso
+    reg miso_sync1;
+    reg miso_sync2;
+
+    // Signals to connect to SPI core
+    wire        spi_ready;
+    wire        spi_busy;
+    wire        spi_done;
+    wire        spi_irq;
+    wire [7:0]  spi_rx_data;
+    reg         spi_start;
+    wire        reset_n;
+
+    assign reset_n = ARESETN;
+
+    // Assign outputs
+    assign AWREADY = axi_awready;
+    assign WREADY  = axi_wready;
+    assign BVALID  = axi_bvalid;
+    assign BRESP   = axi_bresp;
+    assign ARREADY = axi_arready;
+    assign RVALID  = axi_rvalid;
+    assign RRESP   = axi_rresp;
+    assign RDATA   = axi_rdata;
+
+    // ----------------------------------------------------------------
+    // Metastability Protection - Two-stage synchronizer for miso
+    // ----------------------------------------------------------------
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            miso_sync1 <= 1'b0;
+            miso_sync2 <= 1'b0;
+        end else begin
+            miso_sync1 <= miso;
+            miso_sync2 <= miso_sync1;
+        end
+    end
+
+    // ----------------------------------------------------------------
+    // SPI Master Core Instantiation
+    // ----------------------------------------------------------------
     spi_master #(
-        .DEFAULT_CLK_DIV(DEFAULT_CLK_DIV)
-    ) spi_core (
-        .clk        (axi_aclk),
-        .reset      (reset),
-        .start      (control_start),
-        .tx_data    (tx_data_reg),
-        .clk_div_in (clk_div_reg),
+        .DEFAULT_CLK_DIV(4)
+    ) spi_core_inst (
+        .clk        (ACLK),
+        .reset      (~ARESETN),
+        .start      (spi_start),
+        .tx_data    (reg_tx),
+        .clk_div_in (reg_clk_div),
         .rx_data    (spi_rx_data),
         .ready      (spi_ready),
         .busy       (spi_busy),
         .done       (spi_done),
         .irq        (spi_irq),
-        .miso       (miso),
+        .miso       (miso_sync2),
         .mosi       (mosi),
         .sclk       (sclk),
         .cs         (cs)
     );
     
-    // Interrupt logic
-    always @(posedge axi_aclk or posedge reset) begin
-        if (reset) begin
-            irq_flag <= 1'b0;
+    // ----------------------------------------------------------------
+    // PROPER SPI START PULSE GENERATION
+    // ----------------------------------------------------------------
+    
+    // Capture start request
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            spi_start_req <= 1'b0;
         end else begin
-            // Priority to clear over set
-            if (axi_write_state == AXI_WRITE_DATA && 
-                write_addr[4:0] == ADDR_STATUS && 
-                s_axi_wstrb[0] &&  // Only if writing to byte 0
-                s_axi_wdata[3] == 1'b0) begin
-                // Clear IRQ flag when writing 0 to status[3]
-                irq_flag <= 1'b0;
-            end else if (spi_irq) begin
-                irq_flag <= 1'b1;
+            // Debug: tampilkan kondisi untuk start
+            if (write_enable && valid_write_addr && 
+                (latched_awaddr[5:2] == ADDR_CTRL[5:2]) &&
+                latched_wdata[0] && latched_wstrb[0]) begin
+                spi_start_req <= 1'b1;
+                $display("[%0t] AXI_WRAPPER: spi_start_req SET (AWADDR=0x%0h, WDATA=0x%0h, WSTRB=0x%0h)", $time, latched_awaddr, latched_wdata, latched_wstrb);
+            end else if (spi_start_pulse) begin
+                spi_start_req <= 1'b0;
             end
         end
     end
     
-    assign irq_out = irq_flag & control_enable_irq;
-    
-    // AXI Write Logic
-    always @(posedge axi_aclk or posedge reset) begin
-        if (reset) begin
-            axi_write_state  <= AXI_WRITE_IDLE;
-            s_axi_awready    <= 1'b0;
-            s_axi_wready     <= 1'b0;
-            s_axi_bvalid     <= 1'b0;
-            s_axi_bresp      <= 2'b00;
-            write_addr       <= 0;
-            control_start    <= 1'b0;
-            control_enable_irq <= 1'b0;
-            tx_data_reg      <= 8'h00;
-            clk_div_reg      <= DEFAULT_CLK_DIV;
+    // Generate single-cycle start pulse
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            spi_start_pulse <= 1'b0;
+            spi_start <= 1'b0;
         end else begin
-            // Auto-clear start bit
-            control_start <= 1'b0;
-            
-            case (axi_write_state)
-                AXI_WRITE_IDLE: begin
-                    s_axi_bvalid <= 1'b0;
-                    s_axi_bresp  <= 2'b00;  // Reset response
-                    if (s_axi_awvalid) begin
-                        s_axi_awready   <= 1'b1;
-                        write_addr      <= s_axi_awaddr;
-                        axi_write_state <= AXI_WRITE_DATA;
-                    end
+            spi_start_pulse <= spi_start_req && !spi_busy;
+            spi_start <= spi_start_pulse;  // Direct assignment for simplicity
+            if (spi_start_pulse)
+                $display("[%0t] AXI_WRAPPER: spi_start_pulse ACTIVE", $time);
+        end
+    end
+
+    // ----------------------------------------------------------------
+    // AXI Write Logic
+    // ----------------------------------------------------------------
+    
+    // AWREADY logic
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            axi_awready <= 1'b0;
+            aw_received <= 1'b0;
+            latched_awaddr <= 0;
+        end else begin
+            if (AWVALID && !aw_received) begin
+                axi_awready <= 1'b1;
+                aw_received <= 1'b1;
+                latched_awaddr <= AWADDR;
+            end else begin
+                axi_awready <= 1'b0;
+                if (w_received && aw_received && !axi_bvalid) begin
+                    aw_received <= 1'b0;
                 end
-                
-                AXI_WRITE_DATA: begin
-                    s_axi_awready <= 1'b0;
-                    if (s_axi_wvalid) begin
-                        s_axi_wready <= 1'b1;
-                        axi_write_state <= AXI_WRITE_RESP;
-                        
-                        // Register writes with wstrb handling
-                        case (write_addr[4:0])
-                            ADDR_CONTROL: begin
-                                if (s_axi_wstrb[0]) begin
-                                    control_start      <= s_axi_wdata[0];
-                                    control_enable_irq <= s_axi_wdata[1];
-                                end
-                            end
-                            ADDR_TX_DATA: begin
-                                if (s_axi_wstrb[0]) tx_data_reg <= s_axi_wdata[7:0];
-                            end
-                            ADDR_CLK_DIV: begin
-                                if (!spi_busy) begin // Only allow write when not busy
-                                    if (s_axi_wstrb[0]) clk_div_reg[7:0]  <= s_axi_wdata[7:0];
-                                    if (s_axi_wstrb[1]) clk_div_reg[15:8] <= s_axi_wdata[15:8];
-                                end else begin
-                                    s_axi_bresp <= 2'b10; // SLVERR - cannot write while busy
-                                end
-                            end
-                            default: begin
-                                s_axi_bresp <= 2'b10; // SLVERR
-                            end
-                        endcase
-                    end
+            end
+        end
+    end
+
+    // WREADY logic
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            axi_wready <= 1'b0;
+            w_received <= 1'b0;
+            latched_wdata <= 0;
+            latched_wstrb <= 0;
+        end else begin
+            if (WVALID && !w_received) begin
+                axi_wready <= 1'b1;
+                w_received <= 1'b1;
+                latched_wdata <= WDATA;  
+                latched_wstrb <= WSTRB; 
+            end else begin
+                axi_wready <= 1'b0;
+                if (w_received && aw_received && !axi_bvalid) begin
+                    w_received <= 1'b0;
                 end
-                
-                AXI_WRITE_RESP: begin
-                    s_axi_wready <= 1'b0;
-                    if (!s_axi_bvalid) begin
-                        s_axi_bvalid <= 1'b1;
-                    end else if (s_axi_bready) begin
-                        s_axi_bvalid    <= 1'b0;
-                        axi_write_state <= AXI_WRITE_IDLE;
-                    end
+            end
+        end
+    end
+
+    wire valid_write_addr;
+    assign valid_write_addr = (latched_awaddr[5:2] == ADDR_CTRL[5:2]) ||
+                              (latched_awaddr[5:2] == ADDR_STAT[5:2]) ||
+                              (latched_awaddr[5:2] == ADDR_TX[5:2]) ||
+                              (latched_awaddr[5:2] == ADDR_CLK_DIV[5:2]);
+
+    wire valid_read_addr;
+    assign valid_read_addr = (axi_araddr[5:2] == ADDR_STAT[5:2]) ||
+                             (axi_araddr[5:2] == ADDR_RX[5:2]) ||
+                             (axi_araddr[5:2] == ADDR_CLK_DIV[5:2]);
+
+    wire write_enable = aw_received && w_received && !axi_bvalid;
+    
+    function [31:0] apply_wstrb;
+        input [31:0] old_data;
+        input [31:0] new_data;
+        input [3:0]  strb;
+        integer i;
+        begin
+            apply_wstrb = old_data;
+            for (i = 0; i < 4; i = i + 1) begin
+                if (strb[i]) begin
+                    apply_wstrb[i*8 +: 8] = new_data[i*8 +: 8];
                 end
-            endcase
+            end
+        end
+    endfunction
+    
+    // FIX #2: REGISTER WRITE LOGIC - Allow writes even when not ready
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            reg_ctrl    <= 32'h0;
+            reg_tx      <= 8'h0;
+            reg_clk_div <= 16'd4;  
+        end else begin
+            if (write_enable && valid_write_addr) begin  
+                case (latched_awaddr[5:2])
+                    ADDR_CTRL[5:2]: begin
+                        reg_ctrl <= apply_wstrb(reg_ctrl, latched_wdata, latched_wstrb);
+                        $display("[%0t] AXI: CTRL Write, Data=0x%08h, WSTRB=0x%1h", $time, latched_wdata, latched_wstrb);
+                    end
+                    ADDR_TX[5:2]: begin
+                        if (latched_wstrb[0]) begin
+                            reg_tx <= latched_wdata[7:0];
+                            $display("[%0t] AXI: TX Write, Data=0x%02h", $time, latched_wdata[7:0]);
+                        end
+                    end
+                    ADDR_CLK_DIV[5:2]: begin
+                        if (latched_wstrb[0]) begin
+                            reg_clk_div[7:0]  <= latched_wdata[7:0];
+                            $display("[%0t] AXI: CLK_DIV Write, Data[7:0]=0x%02h", $time, latched_wdata[7:0]);
+                        end
+                        if (latched_wstrb[1]) begin
+                            reg_clk_div[15:8] <= latched_wdata[15:8];
+                            $display("[%0t] AXI: CLK_DIV Write, Data[15:8]=0x%02h", $time, latched_wdata[15:8]);
+                        end
+                    end
+                    ADDR_STAT[5:2]: begin
+                        if (latched_wstrb[0]) begin  
+                            if (latched_wdata[2]) reg_done_sticky <= 1'b0;
+                            if (latched_wdata[3]) reg_irq_sticky <= 1'b0;
+                            $display("[%0t] AXI: STAT Write, Data=0x%08h, WSTRB=0x%1h", $time, latched_wdata, latched_wstrb);
+                        end
+                    end
+                endcase
+            end
         end
     end
     
-    // AXI Read Logic
-    always @(posedge axi_aclk or posedge reset) begin
-        if (reset) begin
-            axi_read_state <= AXI_READ_IDLE;
-            s_axi_arready  <= 1'b0;
-            s_axi_rvalid   <= 1'b0;
-            s_axi_rdata    <= 32'h0;
-            s_axi_rresp    <= 2'b00;
-            read_addr      <= 0;
+    // BVALID and BRESP logic
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            axi_bvalid <= 1'b0;
+            axi_bresp  <= 2'b0;
         end else begin
-            case (axi_read_state)
-                AXI_READ_IDLE: begin
-                    s_axi_rvalid <= 1'b0;
-                    if (s_axi_arvalid) begin
-                        s_axi_arready   <= 1'b1;
-                        read_addr       <= s_axi_araddr;
-                        axi_read_state  <= AXI_READ_DATA;
-                    end
-                end
+            if (write_enable && !axi_bvalid) begin
+                axi_bvalid <= 1'b1;
+                axi_bresp <= valid_write_addr ? 2'b00 : 2'b10;
+            end else if (BREADY && axi_bvalid) begin
+                axi_bvalid <= 1'b0;
+            end
+        end
+    end
+    
+    // ----------------------------------------------------------------
+    // AXI Read Logic
+    // ----------------------------------------------------------------
+    
+    // ARREADY logic
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            axi_arready <= 1'b0;
+        end else begin
+            if (~axi_arready && ARVALID) begin
+                axi_arready <= 1'b1;
+            end else begin
+                axi_arready <= 1'b0;
+            end
+        end
+    end
+
+    // Store read address
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            axi_araddr <= 0;
+        end else begin
+            if (~axi_arready && ARVALID) begin
+                axi_araddr <= ARADDR;
+            end
+        end
+    end
+    
+    // RVALID and RDATA logic
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            axi_rvalid <= 1'b0;
+            axi_rresp  <= 2'b0;
+        end else begin
+            if (axi_arready && ARVALID && ~axi_rvalid) begin
+                axi_rvalid <= 1'b1;
+                axi_rresp <= valid_read_addr ? 2'b00 : 2'b10;
                 
-                AXI_READ_DATA: begin
-                    s_axi_arready <= 1'b0;
-                    s_axi_rvalid  <= 1'b1;
-                    
-                    // Default values
-                    s_axi_rresp <= 2'b00; // OKAY
-                    s_axi_rdata <= 32'h0;
-                    
-                    // Register reads
-                    case (read_addr[4:0])
-                        ADDR_CONTROL: begin
-                            s_axi_rdata <= {30'h0, control_enable_irq, control_start};
-                        end
-                        ADDR_STATUS: begin
-                            s_axi_rdata <= {28'h0, irq_flag, spi_done, spi_busy, spi_ready};
-                        end
-                        ADDR_TX_DATA: begin
-                            s_axi_rdata <= {24'h0, tx_data_reg};
-                        end
-                        ADDR_RX_DATA: begin
-                            s_axi_rdata <= {24'h0, spi_rx_data};
-                        end
-                        ADDR_CLK_DIV: begin
-                            s_axi_rdata <= {16'h0, clk_div_reg};
-                        end
-                        default: begin
-                            s_axi_rresp <= 2'b10; // SLVERR
-                        end
-                    endcase
-                    
-                    if (s_axi_rready) begin
-                        s_axi_rvalid   <= 1'b0;
-                        axi_read_state <= AXI_READ_IDLE;
+                case (axi_araddr[5:2])
+                    ADDR_STAT[5:2]: begin
+                        // FIX #3: STATUS REGISTER - Match testbench expectations
+                        axi_rdata <= {28'h0, 
+                                     reg_irq_sticky,   // Bit 3: IRQ (sticky)
+                                     reg_done_sticky,  // Bit 2: Done (sticky)  
+                                     spi_ready,        // Bit 1: Ready (real-time)
+                                     spi_busy};        // Bit 0: Busy (real-time)
                     end
+                    ADDR_RX[5:2]:      axi_rdata <= {24'h0, reg_rx};
+                    ADDR_CLK_DIV[5:2]: axi_rdata <= {16'h0, reg_clk_div};
+                    default:           axi_rdata <= 32'h0;
+                endcase
+            end else if (RREADY && axi_rvalid) begin
+                axi_rvalid <= 1'b0;
+            end
+        end
+    end
+
+    // ----------------------------------------------------------------
+    // SPI Status Management
+    // ----------------------------------------------------------------
+    
+    // Update sticky status flags
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            reg_done_sticky <= 1'b0;
+            reg_irq_sticky <= 1'b0;
+        end else begin
+            // Set sticky bits when events occur
+            if (spi_done) begin
+                reg_done_sticky <= 1'b1;
+            end
+            if (spi_irq) begin
+                reg_irq_sticky <= 1'b1;
+            end
+            
+            // Clear on write to status register (W1C)
+            if (write_enable && valid_write_addr && (latched_awaddr[5:2] == ADDR_STAT[5:2])) begin
+                if (latched_wstrb[0]) begin
+                    if (latched_wdata[2]) reg_done_sticky <= 1'b0;
+                    if (latched_wdata[3]) reg_irq_sticky <= 1'b0;
                 end
-            endcase
+            end
+        end
+    end
+    
+    // Latch the received data from SPI core when done
+    always @(posedge ACLK) begin
+        if (!ARESETN) begin
+            reg_rx <= 8'h0;
+        end else if (spi_done) begin
+            reg_rx <= spi_rx_data;
+            $display("[%0t] AXI: RX Updated, Data=0x%02h", $time, spi_rx_data);
+        end
+    end
+
+    always @(posedge ACLK) begin
+        if (spi_start) begin
+            $display("[%0t] SPI_MASTER: Start pulse generated, TX=0x%02h", $time, reg_tx);
+        end
+        if (spi_done) begin
+            $display("[%0t] SPI_MASTER: Transfer done, RX=0x%02h", $time, spi_rx_data);
         end
     end
 

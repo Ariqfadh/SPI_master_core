@@ -2,247 +2,349 @@
 
 module axi_spi_master_tb;
 
-    parameter CLK_PERIOD = 10;
+    // ----------------------------------------------------------------
+    // Clock and Reset
+    // ----------------------------------------------------------------
+    reg ACLK;
+    reg ARESETN;
     
-    // Signals
-    reg         clk;
-    reg         resetn;
-    reg [31:0]  awaddr;
-    reg         awvalid;
-    wire        awready;
-    reg [31:0]  wdata;
-    reg [3:0]   wstrb;
-    reg         wvalid;
-    wire        wready;
-    wire [1:0]  bresp;
-    wire        bvalid;
-    reg         bready;
-    reg [31:0]  araddr;
-    reg         arvalid;
-    wire        arready;
-    wire [31:0] rdata;
-    wire [1:0]  rresp;
-    wire        rvalid;
-    reg         rready;
-    reg         miso;
-    wire        mosi;
-    wire        sclk;
-    wire        cs;
-    wire        irq;
+    initial ACLK = 0;
+    always #5 ACLK = ~ACLK;  // 100 MHz clock (10ns period)
+
+    // ----------------------------------------------------------------
+    // AXI Interface Signals
+    // ----------------------------------------------------------------
+    reg [31:0] AWADDR;
+    reg        AWVALID;
+    wire       AWREADY;
+    reg [31:0] WDATA;
+    reg [3:0]  WSTRB;
+    reg        WVALID;
+    wire       WREADY;
+    wire [1:0] BRESP;
+    wire       BVALID;
+    reg        BREADY;
     
-    // DUT
-    axi_spi_master dut (
-        .axi_aclk(clk),
-        .axi_aresetn(resetn),
-        .s_axi_awaddr(awaddr),
-        .s_axi_awprot(3'b000),
-        .s_axi_awvalid(awvalid),
-        .s_axi_awready(awready),
-        .s_axi_wdata(wdata),
-        .s_axi_wstrb(wstrb),
-        .s_axi_wvalid(wvalid),
-        .s_axi_wready(wready),
-        .s_axi_bresp(bresp),
-        .s_axi_bvalid(bvalid),
-        .s_axi_bready(bready),
-        .s_axi_araddr(araddr),
-        .s_axi_arprot(3'b000),
-        .s_axi_arvalid(arvalid),
-        .s_axi_arready(arready),
-        .s_axi_rdata(rdata),
-        .s_axi_rresp(rresp),
-        .s_axi_rvalid(rvalid),
-        .s_axi_rready(rready),
-        .miso(miso),
-        .mosi(mosi),
+    reg [31:0] ARADDR;
+    reg        ARVALID;
+    wire       ARREADY;
+    wire [31:0] RDATA;
+    wire [1:0]  RRESP;
+    wire        RVALID;
+    reg         RREADY;
+
+    // ----------------------------------------------------------------
+    // SPI Physical Interface
+    // ----------------------------------------------------------------
+    wire sclk;
+    wire mosi;
+    wire miso;
+    wire cs;
+
+    // ----------------------------------------------------------------
+    // Register Addresses
+    // ----------------------------------------------------------------
+    localparam ADDR_CTRL    = 32'h00;
+    localparam ADDR_STAT    = 32'h04;
+    localparam ADDR_TX      = 32'h08;
+    localparam ADDR_RX      = 32'h0C;
+    localparam ADDR_CLK_DIV = 32'h10;
+
+    // ----------------------------------------------------------------
+    // DUT Instantiation
+    // ----------------------------------------------------------------
+    axi4lite_wrapper_spi #(
+        .AXI_ADDR_WIDTH(32),
+        .AXI_DATA_WIDTH(32)
+    ) dut (
+        .ACLK(ACLK),
+        .ARESETN(ARESETN),
+        .AWADDR(AWADDR),
+        .AWVALID(AWVALID),
+        .AWREADY(AWREADY),
+        .WDATA(WDATA),
+        .WSTRB(WSTRB),
+        .WVALID(WVALID),
+        .WREADY(WREADY),
+        .BRESP(BRESP),
+        .BVALID(BVALID),
+        .BREADY(BREADY),
+        .ARADDR(ARADDR),
+        .ARVALID(ARVALID),
+        .ARREADY(ARREADY),
+        .RDATA(RDATA),
+        .RRESP(RRESP),
+        .RVALID(RVALID),
+        .RREADY(RREADY),
         .sclk(sclk),
-        .cs(cs),
-        .irq_out(irq)
+        .mosi(mosi),
+        .miso(miso),
+        .cs(cs)
     );
+
+    // ----------------------------------------------------------------
+    // IMPROVED: SPI Slave Model with Configurable Response
+    // ----------------------------------------------------------------
+    reg [7:0] slave_shift_reg;
+    reg [7:0] slave_tx_data = 8'hA5;  // Default response
+    reg [2:0] slave_bit_counter;
+    reg       slave_active;
     
-    // Clock
-    always #(CLK_PERIOD/2) clk = ~clk;
+    initial begin
+        slave_shift_reg = 8'h0;
+        slave_bit_counter = 3'b0;
+        slave_active = 1'b0;
+    end
     
-    // Simple loopback
+    // Detect CS going active and load shift register
+    always @(negedge cs) begin
+        slave_shift_reg <= slave_tx_data;
+        slave_bit_counter <= 3'b0;
+        slave_active <= 1'b1;
+        $display("[%0t] SPI Slave: CS Active, Loading TX Data = 0x%0h", $time, slave_tx_data);
+    end
+    
+    always @(posedge cs) begin
+        slave_active <= 1'b0;
+    end
+    
+    // MISO output - drive MSB when active
+    assign miso = (slave_active) ? slave_shift_reg[7] : 1'bz;
+
+    // Sampling MOSI (master out) pada rising edge SCLK
+    reg [7:0] slave_rx_reg;
     always @(posedge sclk) begin
-        if (!cs) miso <= mosi;
+        if (slave_active) begin
+            slave_rx_reg <= {slave_rx_reg[6:0], mosi};
+        end
+        if (slave_active && slave_bit_counter == 3'd7) begin
+            $display("[%0t] SPI Slave: Received byte = 0x%0h", $time, {slave_rx_reg[6:0], mosi});
+        end
     end
+
+    // Geser shift register (untuk output MISO) pada falling edge SCLK
+    always @(negedge sclk) begin
+        if (slave_active) begin
+            slave_shift_reg <= {slave_shift_reg[6:0], 1'b0};
+            slave_bit_counter <= slave_bit_counter + 1;
+        end
+    end
+
+    task set_slave_response;
+        input [7:0] data;
+        begin
+            slave_tx_data = data;
+            $display("[%0t] SPI Slave: Response set to 0x%0h", $time, data);
+        end
+    endtask
+
+    // ----------------------------------------------------------------
+    // AXI Write Task (Optimized)
+    // ----------------------------------------------------------------
+    task axi_write;
+        input [31:0] addr;
+        input [31:0] data;
+        input [3:0]  strb;
+        begin
+            @(posedge ACLK);
+            AWADDR  <= addr;
+            AWVALID <= 1'b1;
+            WDATA   <= data;
+            WSTRB   <= strb;
+            WVALID  <= 1'b1;
+            BREADY  <= 1'b1;
+            
+            fork
+                begin
+                    wait(AWREADY && AWVALID);
+                    @(posedge ACLK);
+                    AWVALID <= 1'b0;
+                end
+                begin
+                    wait(WREADY && WVALID);
+                    @(posedge ACLK);
+                    WVALID <= 1'b0;
+                end
+                begin
+                    wait(BVALID && BREADY);
+                    @(posedge ACLK);
+                    BREADY <= 1'b0;
+                end
+            join
+            
+            if (BRESP == 2'b00) begin
+                $display("[%0t] AXI Write OK: Addr=0x%0h, Data=0x%0h, Strb=0x%0h", 
+                         $time, addr, data, strb);
+            end else begin
+                $display("[%0t] AXI Write ERROR: Addr=0x%0h, BRESP=0x%0h", 
+                         $time, addr, BRESP);
+            end
+        end
+    endtask
+
+    task axi_write_simple;
+        input [31:0] addr;
+        input [31:0] data;
+        begin
+            axi_write(addr, data, 4'hF);
+        end
+    endtask
+
+    // ----------------------------------------------------------------
+    // AXI Read Task (Optimized)
+    // ----------------------------------------------------------------
+    task axi_read;
+        input  [31:0] addr;
+        output [31:0] data;
+        begin
+            @(posedge ACLK);
+            ARADDR  <= addr;
+            ARVALID <= 1'b1;
+            RREADY  <= 1'b1;
+            
+            fork
+                begin
+                    wait(ARREADY && ARVALID);
+                    @(posedge ACLK);
+                    ARVALID <= 1'b0;
+                end
+                begin
+                    wait(RVALID && RREADY);
+                    data = RDATA;
+                    @(posedge ACLK);
+                    RREADY <= 1'b0;
+                end
+            join
+            
+            if (RRESP == 2'b00) begin
+                $display("[%0t] AXI Read OK: Addr=0x%0h, Data=0x%0h", 
+                         $time, addr, data);
+            end else begin
+                $display("[%0t] AXI Read ERROR: Addr=0x%0h, RRESP=0x%0h", 
+                         $time, addr, RRESP);
+            end
+        end
+    endtask
+
+    // ----------------------------------------------------------------
+    // Consolidated Test Stimulus (Single Initial Block)
+    // ----------------------------------------------------------------
+    reg [31:0] read_data;
+    reg [7:0]  rx_byte;
     
     initial begin
-        // Init
-        clk = 0;
-        resetn = 0;
-        awaddr = 0;
-        awvalid = 0;
-        wdata = 0;
-        wstrb = 0;
-        wvalid = 0;
-        bready = 1;
-        araddr = 0;
-        arvalid = 0;
-        rready = 1;
-        miso = 0;
+        $display("\n========================================");
+        $display("  AXI-SPI Master Testbench Start");
+        $display("========================================\n");
         
-        #100 resetn = 1;
-        #50;
+        // Initialize signals
+        ARESETN = 0;
+        AWADDR = 0; AWVALID = 0;
+        WDATA = 0; WSTRB = 0; WVALID = 0;
+        BREADY = 0;
+        ARADDR = 0; ARVALID = 0;
+        RREADY = 0;
         
-        $display("=== AXI SPI Master Testbench ===");
+        // Reset sequence
+        repeat(5) @(posedge ACLK);
+        ARESETN = 1;
+        $display("[%0t] Reset released\n", $time);
         
-        // Write to TX_DATA (0x08)
-        $display("[INFO] Writing TX data: 0x55");
+        repeat(5) @(posedge ACLK);
         
-        // AXI Write Address Phase
-        @(posedge clk);
-        awaddr = 32'h08;
-        awvalid = 1;
+        // ============================================================
+        // TEST 1: Simple 8-bit SPI Transaction
+        // ============================================================
+        $display("-------- TEST 1: Simple 8-bit Transaction --------");
         
-        $display("[DEBUG] Waiting for awready...");
-        wait(awready);
-        @(posedge clk);
-        awvalid = 0;
-        $display("[DEBUG] Address phase complete");
+        // Set clock divider
+        axi_write_simple(ADDR_CLK_DIV, 32'h00000004);
         
-        // AXI Write Data Phase
-        wdata = 32'h55;
-        wvalid = 1;
-        wstrb = 4'hF;
+        // Configure slave to echo the same data
+        set_slave_response(8'hA5);
         
-        $display("[DEBUG] Waiting for wready...");
-        wait(wready);
-        @(posedge clk);
-        wvalid = 0;
-        $display("[DEBUG] Data phase complete");
+        // Write data to TX register
+        axi_write_simple(ADDR_TX, 32'h000000A5);
         
-        // AXI Write Response Phase
-        $display("[DEBUG] Waiting for bvalid...");
-        wait(bvalid);
-        @(posedge clk);
-        $display("[INFO] TX Data written successfully");
+        // Start SPI transaction
+        axi_write_simple(ADDR_CTRL, 32'h00000001);
         
-        // Start transfer (write to CONTROL 0x00)
-        $display("[INFO] Starting SPI transfer");
+        // Poll status until not busy
+        $display("[%0t] Polling STATUS register...", $time);
+        read_data = 32'hFFFFFFFF;
+        while (read_data[0] == 1'b1) begin
+            axi_read(ADDR_STAT, read_data);
+            repeat(2) @(posedge ACLK);
+        end
+        $display("[%0t] SPI transaction complete (busy=0)", $time);
+        $display("[%0t] Status: busy=%b, ready=%b, done=%b", 
+                 $time, read_data[0], read_data[1], read_data[2]);
         
-        // Address phase
-        @(posedge clk);
-        awaddr = 32'h00;
-        awvalid = 1;
-        wait(awready);
-        @(posedge clk);
-        awvalid = 0;
+        // Read RX register
+        axi_read(ADDR_RX, read_data);
         
-        // Data phase
-        wdata = 32'h01; // start bit
-        wvalid = 1;
-        wait(wready);
-        @(posedge clk);
-        wvalid = 0;
-        
-        // Response phase
-        wait(bvalid);
-        @(posedge clk);
-        $display("[INFO] Transfer started");
-        
-        // Wait for SPI completion
-        $display("[INFO] Waiting for SPI completion...");
-        #5000;
-        
-        // Read status (0x04)
-        araddr = 32'h04;
-        arvalid = 1;
-        
-        wait(arready);
-        @(posedge clk);
-        arvalid = 0;
-        
-        wait(rvalid);
-        $display("[INFO] Status register: 0x%08h", rdata);
-        
-        // Read RX data (0x0C)
-        @(posedge clk);
-        araddr = 32'h0C;
-        arvalid = 1;
-        
-        wait(arready);
-        @(posedge clk);
-        arvalid = 0;
-        
-        wait(rvalid);
-        $display("[INFO] RX Data: 0x%08h", rdata);
-        
-        if (rdata[7:0] == 8'h55) begin
-            $display("[PASS] Loopback test successful!");
+        // Verify received data
+        if (read_data[7:0] == 8'hA5) begin
+            $display("*** TEST 1 PASSED: RX=0x%02h matches expected 0x%02h ***\n", 
+                     read_data[7:0], 8'hA5);
         end else begin
-            $display("[FAIL] Loopback test failed - expected 0x55, got 0x%02h", rdata[7:0]);
+            $display("*** TEST 1 FAILED: Expected 0x%02h, Got 0x%02h ***\n", 
+                     8'hA5, read_data[7:0]);
         end
         
-        // Test another pattern
-        $display("\n=== Testing pattern 0xAA ===");
+        repeat(10) @(posedge ACLK);
         
-        // Write TX data
-        @(posedge clk);
-        awaddr = 32'h08;
-        awvalid = 1;
-        wdata = 32'hAA;
-        wvalid = 1;
-        wstrb = 4'hF;
+        // ============================================================
+        // TEST 2: Another Transaction with Different Data
+        // ============================================================
+        $display("-------- TEST 2: Second Transaction (0x5A) --------");
         
-        wait(awready && wready);
-        @(posedge clk);
-        awvalid = 0;
-        wvalid = 0;
-        wait(bvalid);
+        // Configure slave with different response
+        set_slave_response(8'h5A);
         
-        // Start transfer
-        @(posedge clk);
-        awaddr = 32'h00;
-        awvalid = 1;
-        wdata = 32'h01;
-        wvalid = 1;
+        axi_write_simple(ADDR_TX, 32'h0000005A);
+        axi_write_simple(ADDR_CTRL, 32'h00000001);
         
-        wait(awready && wready);
-        @(posedge clk);
-        awvalid = 0;
-        wvalid = 0;
-        wait(bvalid);
-        
-        // Wait and read result
-        #5000;
-        
-        araddr = 32'h0C;
-        arvalid = 1;
-        wait(arready);
-        @(posedge clk);
-        arvalid = 0;
-        wait(rvalid);
-        
-        $display("[INFO] RX Data: 0x%08h", rdata);
-        if (rdata[7:0] == 8'hAA) begin
-            $display("[PASS] Second test successful!");
-        end else begin
-            $display("[FAIL] Second test failed");
+        // Poll status
+        read_data = 32'hFFFFFFFF;
+        while (read_data[0] == 1'b1) begin
+            axi_read(ADDR_STAT, read_data);
+            repeat(2) @(posedge ACLK);
         end
         
-        #1000;
-        $display("\n=== Test completed ===");
+        axi_read(ADDR_RX, read_data);
+        
+        if (read_data[7:0] == 8'h5A) begin
+            $display("*** TEST 2 PASSED: RX=0x%02h matches expected 0x%02h ***\n", 
+                     read_data[7:0], 8'h5A);
+        end else begin
+            $display("*** TEST 2 FAILED: Expected 0x%02h, Got 0x%02h ***\n", 
+                     8'h5A, read_data[7:0]);
+        end
+        
+        repeat(20) @(posedge ACLK);
+        
+        $display("========================================");
+        $display("  Testbench Complete");
+        $display("========================================\n");
+        
         $finish;
     end
     
-    // Timeout watchdog
+    // ----------------------------------------------------------------
+    // Timeout Watchdog
+    // ----------------------------------------------------------------
     initial begin
-        #10000; // Shorter timeout for debugging
-        $display("[ERROR] Testbench timeout!");
-        $display("[DEBUG] Current signals:");
-        $display("  awready = %b", awready);
-        $display("  wready = %b", wready);  
-        $display("  bvalid = %b", bvalid);
-        $display("  arready = %b", arready);
-        $display("  rvalid = %b", rvalid);
+        #500000; // 500us timeout (increased)
+        $display("\n*** ERROR: Testbench timeout! ***\n");
         $finish;
     end
     
-    // Dump waveforms
+    // ----------------------------------------------------------------
+    // Waveform dump
+    // ----------------------------------------------------------------
     initial begin
-        $dumpfile("axi_spi_master_tb.vcd");
+        $dumpfile("axi_spi_tb.vcd");
         $dumpvars(0, axi_spi_master_tb);
     end
 

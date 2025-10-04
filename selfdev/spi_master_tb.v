@@ -65,9 +65,9 @@ module spi_master_tb;
     $display("Sent: 0x%0h, Received: 0x%0h", tx_data, rx_data);
 
     if (tx_data == rx_data)
-      $display("✅ Test Passed");
+      $display(" Test Passed");
     else
-      $display("❌ Test Failed");
+      $display(" Test Failed");
 
     #50;
 
@@ -79,9 +79,9 @@ module spi_master_tb;
     wait(done);
     $display("Sent: 0x%0h, Received: 0x%0h", tx_data, rx_data);
         if (tx_data == rx_data)
-      $display("✅ Test Passed");
+      $display("Test Passed");
     else
-      $display("❌ Test Failed");
+      $display("Test Failed");
 
     #50;
     $finish;

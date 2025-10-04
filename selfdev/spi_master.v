@@ -101,6 +101,7 @@ module spi_master #(
                         bit_cnt     <= 8;
                         sclk_en     <= 1;
                         clk_div_reg <= (clk_div_in == 0) ? DEFAULT_CLK_DIV : clk_div_in; 
+                        $display("[SPI_MASTER] Start received: TX=0x%02h, CLK_DIV=%d", tx_data, clk_div_in);
                     end
                 end
 
@@ -126,6 +127,7 @@ module spi_master #(
                     sclk_en <= 0;
                     rx_data <= rx_shift;
                     irq     <= 1; 
+                    $display("[SPI_MASTER] Transfer done: RX=0x%02h", rx_shift);
                 end
             endcase
         end
