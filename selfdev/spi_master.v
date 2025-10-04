@@ -106,17 +106,18 @@ module spi_master #(
                 end
 
                 TRANSFER: begin
-                    // On falling edge: output data
+                    busy <= 1;
+                    
                     if (sclk == 0 && clk_cnt == 0) begin
                         mosi     <= tx_shift[7];
                         tx_shift <= {tx_shift[6:0], 1'b0};
                     end
 
-                    // On rising edge: sample data
                     if (sclk == 1 && clk_cnt == 0) begin
                         rx_shift <= {rx_shift[6:0], miso};
-                        if (bit_cnt > 0)
+                        if (bit_cnt > 0) begin
                             bit_cnt <= bit_cnt - 1;
+                        end
                     end
                 end
 
@@ -139,8 +140,8 @@ module spi_master #(
         case (state)
             READY:    next_state = IDLE;
             IDLE:     if (start) next_state = TRANSFER;
-            TRANSFER: if (bit_cnt == 0 && sclk == 1 && clk_cnt == 0)
-                          next_state = FINISH;
+            TRANSFER: if (bit_cnt == 0 && sclk == 0 && clk_cnt == 0)
+                        next_state = FINISH;
             FINISH:   next_state = READY;
         endcase
     end
